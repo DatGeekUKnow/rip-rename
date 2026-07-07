@@ -1,12 +1,12 @@
 """Build, execute, and reverse rename plans.
 
-Design note: the RenamePlan is the single source of truth. `--dry-run`,
-preview, execute, and undo all consume the same object.
+The RenamePlan is the single source of truth. Preview, dry-run, execute, and
+undo all consume the same object.
 
-V2 addition: `build_plan` accepts an optional `titles` dict mapping episode
-number to title. When a title is present for a given episode, the with-title
-template is used; when absent, we fall back to the without-title template so
-we never produce ugly names like `S02E05 - .mkv`.
+V2.2: `build_plan()` now takes a list of MatchAssignment objects (from
+matcher.py) instead of raw files + start_episode. This lets the matcher own
+the logic of which file maps to which episode(s), including combined-episode
+files like Avatar S02E19-E20.
 """
 from __future__ import annotations
 
@@ -14,13 +14,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .scanner import ScannedFile
+from .matcher import MatchAssignment
 
 
-# Plex/Jellyfin-compatible defaults. See:
+# Plex/Jellyfin-compatible naming templates. See:
 #   https://support.plex.tv/articles/naming-and-organizing-your-tv-show-files/
 DEFAULT_TEMPLATE_WITH_TITLE = "{series} - S{season:02d}E{episode:02d} - {title}"
 DEFAULT_TEMPLATE_WITHOUT_TITLE = "{series} - S{season:02d}E{episode:02d}"
+DEFAULT_TEMPLATE_COMBINED_WITH_TITLE = "{series} - S{season:02d}E{start_ep:02d}-E{end_ep:02d} - {title}"
+DEFAULT_TEMPLATE_COMBINED_WITHOUT_TITLE = "{series} - S{season:02d}E{start_ep:02d}-E{end_ep:02d}"
 
 
 @dataclass
@@ -37,7 +39,7 @@ class RenamePlan:
     series: str
     season: int
     start_episode: int
-    template: str  # informational — the template actually used for the plan
+    template: str          # informational — the template actually used
     source_dir: str
     warnings: list[str] = field(default_factory=list)
 
@@ -55,26 +57,30 @@ def sanitize_for_filename(s: str) -> str:
 
 
 def build_plan(
-    files: list[ScannedFile],
+    assignments: list[MatchAssignment],
     series: str,
     season: int,
     start_episode: int,
     titles: Optional[dict[int, str]] = None,
     template_with_title: str = DEFAULT_TEMPLATE_WITH_TITLE,
     template_without_title: str = DEFAULT_TEMPLATE_WITHOUT_TITLE,
-    include_extras: bool = False,
+    template_combined_with_title: str = DEFAULT_TEMPLATE_COMBINED_WITH_TITLE,
+    template_combined_without_title: str = DEFAULT_TEMPLATE_COMBINED_WITHOUT_TITLE,
 ) -> RenamePlan:
-    """Construct a rename plan from a list of scanned files.
+    """Construct a rename plan from matcher assignments.
 
     Args:
-        files: scanned video files, in the order they should be numbered
-        series: show name (raw, will be sanitized for filesystem safety)
+        assignments: pre-verified file→episode(s) mappings
+        series: show name (raw; will be sanitized for filesystem safety)
         season: season number
-        start_episode: episode number to assign to the first non-extra file
-        titles: optional {episode_number: episode_title}; missing entries
-                fall back to the no-title template for that episode only
-        template_with_title / template_without_title: format strings
-        include_extras: if False, files flagged as extras are skipped
+        start_episode: informational, stored on the plan
+        titles: optional {episode_number: title}; for combined-episode files,
+                only the first episode's title is used
+        templates: format strings for the four combinations of single/combined
+                   and with/without title
+
+    Missing title for a specific episode falls back to the without-title
+    template for that item only (so you don't get "S02E05 - .mkv").
     """
     if season < 0:
         raise ValueError(f"season must be >= 0, got {season}")
@@ -86,7 +92,8 @@ def build_plan(
         raise ValueError("series name is empty after sanitization")
 
     titles = titles or {}
-    source_dir = str(files[0].info.path.parent) if files else ""
+    source_dir = str(assignments[0].file.info.path.parent) if assignments else ""
+
     plan = RenamePlan(
         items=[],
         series=series,
@@ -96,29 +103,44 @@ def build_plan(
         source_dir=source_dir,
     )
 
-    episode = start_episode
-    for f in files:
-        if f.likely_extra and not include_extras:
-            continue
-
-        src = f.info.path
-        raw_title = titles.get(episode, "")
+    for a in assignments:
+        src = a.file.info.path
+        is_combined = len(a.episode_numbers) > 1
+        # For combined episodes, use the first episode's title (per user preference).
+        raw_title = titles.get(a.episode_numbers[0], "") if titles else ""
         safe_title = sanitize_for_filename(raw_title) if raw_title else ""
 
         try:
-            if safe_title:
-                stem = template_with_title.format(
-                    series=safe_series,
-                    season=season,
-                    episode=episode,
-                    title=safe_title,
-                )
+            if is_combined:
+                if safe_title:
+                    stem = template_combined_with_title.format(
+                        series=safe_series,
+                        season=season,
+                        start_ep=a.episode_numbers[0],
+                        end_ep=a.episode_numbers[-1],
+                        title=safe_title,
+                    )
+                else:
+                    stem = template_combined_without_title.format(
+                        series=safe_series,
+                        season=season,
+                        start_ep=a.episode_numbers[0],
+                        end_ep=a.episode_numbers[-1],
+                    )
             else:
-                stem = template_without_title.format(
-                    series=safe_series,
-                    season=season,
-                    episode=episode,
-                )
+                if safe_title:
+                    stem = template_with_title.format(
+                        series=safe_series,
+                        season=season,
+                        episode=a.episode_numbers[0],
+                        title=safe_title,
+                    )
+                else:
+                    stem = template_without_title.format(
+                        series=safe_series,
+                        season=season,
+                        episode=a.episode_numbers[0],
+                    )
         except (KeyError, IndexError, ValueError) as e:
             raise ValueError(f"invalid template: {e}") from e
 
@@ -131,12 +153,11 @@ def build_plan(
         plan.items.append(RenameItem(
             src=str(src),
             dst=str(dst),
-            duration_sec=f.info.duration_sec,
+            duration_sec=a.file.info.duration_sec,
             warnings=item_warnings,
         ))
-        episode += 1
 
-    # Internal collision check
+    # Internal collision check (two sources → same destination)
     dst_paths = [item.dst for item in plan.items]
     duplicates = sorted({p for p in dst_paths if dst_paths.count(p) > 1})
     if duplicates:

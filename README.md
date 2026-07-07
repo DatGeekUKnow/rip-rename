@@ -1,23 +1,21 @@
-# rip-rename (V1)
+# rip-rename (V2.2)
 
-Renames MakeMKV/HandBrake TV rips (`t00.mkv`, `title01.mkv`, ...) to Plex-compatible filenames.
-
-**V1 scope:** rock-solid renaming engine. No network, no TMDb, no runtime heuristics — those come in V2/V3 on top of this foundation.
+Renames MakeMKV/HandBrake TV rips (`t00.mkv`, `title01.mkv`, ...) to Plex-compatible
+filenames, with optional TMDb episode titles and runtime-based verification.
 
 ## Requirements
 
 - Python 3.10+
 - `ffprobe` on PATH (`apt install ffmpeg`)
+- (Optional) Free TMDb API key for episode titles: https://www.themoviedb.org/settings/api
 
 No PyPI dependencies.
 
 ## Install
 
-Just drop the `rip_rename/` directory anywhere and run it as a module. For a
-convenient global command, add a shim:
+Drop the `rip_rename/` directory anywhere and run it as a module, or add a shim:
 
 ```bash
-# From wherever you put the code:
 cat > ~/.local/bin/rip-rename <<'EOF'
 #!/usr/bin/env bash
 exec python3 -m rip_rename "$@"
@@ -25,112 +23,127 @@ EOF
 chmod +x ~/.local/bin/rip-rename
 ```
 
-Make sure the parent directory of `rip_rename/` is on `PYTHONPATH`, or install
-via `pip install -e .` later once you add a `pyproject.toml`.
+Make sure the parent directory of `rip_rename/` is on `PYTHONPATH`.
 
 ## Usage
 
-Interactive (from inside a folder of rips):
-
 ```bash
-rip-rename
+rip-rename                                          # interactive, current dir
+rip-rename /media/handbrake/The\ Magicians          # interactive, given dir
+rip-rename --series "The Magicians" --season 2 --start 5
+rip-rename --dry-run                                # preview only
+rip-rename --yes                                    # skip confirmation
+rip-rename --undo                                   # reverse last rename
+rip-rename --include-extras                         # don't exclude likely extras
+rip-rename --no-titles                              # skip TMDb lookup
+rip-rename --tmdb-key YOUR_KEY                       # set/save TMDb key
 ```
 
-With arguments:
+TMDb key precedence: `--tmdb-key` flag > `TMDB_API_KEY` env var > saved config
+(`~/.config/rip-rename/config.json`).
 
-```bash
-rip-rename /media/handbrake/The\ Magicians --series "The Magicians" --season 2 --start 5
-```
-
-Preview only:
-
-```bash
-rip-rename --dry-run
-```
-
-Skip confirmation:
-
-```bash
-rip-rename --yes
-```
-
-Undo the most recent rename:
-
-```bash
-rip-rename --undo
-```
-
-Include files flagged as likely extras (short runtime):
-
-```bash
-rip-rename --include-extras
-```
-
-## Example session
+## Example session (V2.2, with a combined episode)
 
 ```
-$ rip-rename /media/handbrake/The\ Magicians
-Scanning /media/handbrake/The Magicians...
+$ rip-rename /media/handbrake/Avatar
+Scanning /media/handbrake/Avatar...
 
 Found 3 video file(s):
-   t00.mkv  (43:12)
-   t01.mkv  (43:01)
-   t02.mkv  (42:57)
+    t18.mkv  (22:05)
+    t19.mkv  (44:12)
+    t20.mkv  (22:08)
 
-Series [The Magicians]:
+Series [Avatar: The Last Airbender]:
 Season [2]:
-Starting episode [1]: 5
+Starting episode [1]: 19
+
+Looking up episode data on TMDb...
+
+Classifier:
+  Reference episode length: ~22:00 (from TMDb)
+  Minimum episode duration: 5:00
+
+Analysis:
+  t18.mkv  22:05  ->  S02E19        [MATCH]
+  t19.mkv  44:12  ->  S02E20-E21    [COMBINED]
+  t20.mkv  22:08  ->  S02E22        [MATCH]
+
+Summary: 3 confident rename(s), 0 excluded, 0 missing episode(s).
 
 Preview:
-  t00.mkv
-    -> The Magicians - S02E05.mkv
-  t01.mkv
-    -> The Magicians - S02E06.mkv
-  t02.mkv
-    -> The Magicians - S02E07.mkv
+  t18.mkv
+    -> Avatar_ The Last Airbender - S02E19 - The Guru.mkv
+  t19.mkv
+    -> Avatar_ The Last Airbender - S02E20-E21 - The Crossroads of Destiny.mkv
+  t20.mkv
+    -> Avatar_ The Last Airbender - S02E22 - The Headband.mkv
 
 Proceed? [Y/n]
 
 Renamed 3 file(s).
 ```
 
-## What V1 does for you
+## What it does for you
 
-- Discovers `.mkv`/`.mp4`/`.m4v` files, sorted lexicographically (= disc
-  order = episode order, 90% of the time).
-- Runs `ffprobe` on each file for duration, resolution, and track counts.
-- Flags files shorter than 5 minutes as likely extras (excluded by default).
-- Flags pairs of files with near-identical runtimes as possible duplicate
-  rips (MakeMKV frequently rips commentary tracks as separate titles).
-- Refuses to overwrite existing files.
-- Detects internal collisions in the rename plan (two sources -> same name).
-- Remembers the last-used series and season so re-running takes one keypress.
-- Records every executed plan to `~/.local/share/rip-rename/history.json` for
-  undo (keeps the last 10 operations).
+**Core (V1):**
+- Discovers `.mkv`/`.mp4`/`.m4v` files, sorted lexicographically (disc order).
+- Runs `ffprobe` for duration, resolution, track counts.
+- Refuses to overwrite existing files; detects internal plan collisions.
+- Remembers last-used series/season. Records every executed plan for undo
+  (`~/.local/share/rip-rename/history.json`, last 10 kept).
 
-## What V1 does NOT do
+**TMDb titles (V2):**
+- Looks up show + season on TMDb, caches results
+  (`~/.local/share/rip-rename/cache.json`), prompts to disambiguate multiple
+  show matches.
+- Filenames become `Series - S02E05 - Episode Title.mkv`.
 
-- No TMDb integration (episode titles). Filenames are `Series - S02E05.mkv`,
-  not `Series - S02E05 - Cheat Day.mkv`.
-- No runtime-based episode matching.
+**Smart extras classification (V2.1):**
+- Extras threshold is `max(5min, expected_episode_length × 0.5)` instead of a
+  flat 5-minute floor, so short episodes (e.g. 22-min sitcoms) don't
+  misclassify an 11-min extra as a real episode.
+- Expected episode length comes from TMDb when available, else the median of
+  scanned file durations.
+
+**Runtime verification & multi-episode handling (V2.2):**
+- Filename order is still primary — TMDb runtime is used to *verify*, not to
+  reorder.
+- **Match:** file duration ≈ TMDb runtime (tolerance `max(60s, 3%)`) → rename.
+- **Combined episode** (1 file covers 2 TMDb episodes, e.g. Avatar
+  S02E19-E20 Blu-ray releases): auto-detected by summed runtime, renamed as
+  `SxxEyy-Ezz - Title` using the first episode's title.
+- **Split episode** (2 files sum to 1 TMDb episode, e.g. Office two-parters
+  ripped as separate titles): detected but **blocks the whole batch** —
+  cascade risk if guessed wrong. Rename manually, then rerun.
+- **Past-last-episode:** files beyond the season's episode count with
+  episode-like runtime **blocks the batch** (usually wrong season, or TMDb
+  out of date).
+- **Runtime mismatch:** a file that doesn't match its expected episode (or
+  any episode) is skipped, not renamed; everything else keeps processing.
+- **Missing episodes** (on TMDb, no matching disc file): reported, doesn't
+  block.
+- **No ffprobe data / no TMDb runtime / no TMDb at all:** falls back to
+  filename-order assignment, always warns before you confirm.
+- Per-file analysis table shown before every rename, e.g.
+  `t19.mkv  44:12  ->  S02E20-E21  [COMBINED]`.
+
+## What it does NOT do yet
+
+- No auto-handling of split episodes (Case B) — no established naming
+  convention yet, intentionally left manual.
 - No auto-detection of the newest HandBrake output folder (`rename-last`).
-- No ARM hook.
-
-These are the V2-V5 layers. The plan structure in `rename.py` is designed so
-they can plug in without touching the safety guarantees below.
+- No ARM (Automatic Ripping Machine) hook.
+- No movie support.
 
 ## Design invariants (don't break these)
 
 1. **`RenamePlan` is the single source of truth.** Preview, dry-run, execute,
    and undo all consume the same object.
-2. **History is written BEFORE renames execute.** A crash mid-batch leaves a
-   recoverable log.
+2. **History is written BEFORE renames execute.**
 3. **Execution stops on the first failure.** No mystery half-renamed batches.
-4. **Warnings block execution.** No `--force` in V1 — resolve conflicts
-   manually so the safety net stays intact.
-5. **Runtime analysis (when it lands in V3) reports confidence; it does not
-   silently reorder.** Silent "helpful" automation on filenames is how
-   libraries get corrupted.
+4. **Warnings block execution.** No `--force` — resolve conflicts manually.
+5. **Filename order is primary; runtime is verification only.** Ambiguous or
+   risky cases (splits, past-last-episode) block rather than guess.
 
 ## Module layout
 
@@ -138,33 +151,34 @@ they can plug in without touching the safety guarantees below.
 rip_rename/
 ├── __init__.py
 ├── __main__.py     # python -m rip_rename
-├── cli.py          # argparse, prompts, preview/execute flow
+├── cli.py          # argparse, prompts, TMDb orchestration, preview/execute
 ├── ffprobe.py      # subprocess wrapper around ffprobe
-├── scanner.py      # directory scan + duplicate detection
+├── scanner.py      # directory scan, duplicate detection, extras classification
+├── matcher.py      # runtime-verified file <-> episode matching (V2.2)
 ├── rename.py       # RenamePlan: build, execute, reverse
-└── state.py        # JSON persistence (history stack + defaults)
+├── tmdb.py         # stdlib TMDb API client
+└── state.py        # JSON persistence (history, config, cache, defaults)
 ```
 
-## Where the extension points are
+## Where the remaining extension points are
 
-- **TMDb (V2):** new `metadata.py` module that takes `(series, season)` and
-  returns `{episode_num: title}`. Modify `build_plan()` to accept an
-  optional `titles` dict and change `DEFAULT_TEMPLATE` to include `{title}`.
-- **Runtime matching (V3):** compare `ScannedFile.info.duration_sec` against
-  TMDb-reported runtimes and attach a `confidence_score` to `RenameItem`.
-  Present as a warning if low; never auto-reorder.
-- **`rename-last` (V4):** small function in `cli.py` that finds the newest
-  `mtime` subdir of a configured `default_media_path`, excluding dirs modified
-  within the last N minutes (still-encoding).
-- **ARM hook (V5):** ARM invokes `rip-rename --yes <path>` post-encode. All
-  the safety guarantees still apply.
+- **Split-episode auto-handling:** once a naming convention is settled,
+  extend `matcher.py`'s Case B branch to emit a `MatchAssignment` pair
+  instead of an `Exclusion` pair, and add a template in `rename.py`.
+- **`rename-last`:** small function in `cli.py` that finds the newest `mtime`
+  subdir of a configured `default_media_path`, excluding dirs modified in
+  the last N minutes (still-encoding).
+- **ARM hook:** ARM invokes `rip-rename --yes <path>` post-encode. All
+  safety guarantees still apply.
 
 ## Testing
 
-Not included yet — I'd recommend `pytest` with a temp-directory fixture that
-seeds fake `.mkv` files (empty is fine; ffprobe will fail, and the scanner
-already handles that path). Test targets:
+No formal test suite yet. V2.2's matcher was smoke-tested against 7
+scenarios (happy path, combined episode, split episode, past-last-episode,
+mid-batch mismatch, missing episodes, no-TMDb fallback) — see git history /
+dev notes. Recommend `pytest` with a temp-dir fixture next; priority targets:
 
+- `matcher.match()` against the 7 scenarios above, as real test cases
 - `sanitize_for_filename` edge cases
 - `build_plan` collision detection
 - `execute_plan` refuses on warnings
