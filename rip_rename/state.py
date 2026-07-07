@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .rename import RenamePlan, RenameItem
+from .tmdb import EpisodeInfo
 
 
 HISTORY_LIMIT = 10
@@ -55,7 +56,7 @@ def _config_path() -> Path:
     return config_dir() / "config.json"
 
 
-# ---------- history (unchanged from V1) ----------
+# ---------- history ----------
 
 def _plan_to_dict(plan: RenamePlan) -> dict[str, Any]:
     return {
@@ -123,7 +124,7 @@ def pop_last_plan() -> Optional[RenamePlan]:
     return _plan_from_dict(last["plan"])
 
 
-# ---------- defaults (unchanged from V1) ----------
+# ---------- defaults ----------
 
 def load_defaults() -> dict[str, Any]:
     path = _defaults_path()
@@ -142,7 +143,7 @@ def save_defaults(**kwargs: Any) -> None:
     _defaults_path().write_text(json.dumps(current, indent=2))
 
 
-# ---------- config (new in V2) ----------
+# ---------- config ----------
 
 def load_config() -> dict[str, Any]:
     path = _config_path()
@@ -176,7 +177,7 @@ def get_tmdb_api_key(explicit: Optional[str] = None) -> Optional[str]:
     return cfg_key.strip() if isinstance(cfg_key, str) and cfg_key.strip() else None
 
 
-# ---------- TMDb cache (new in V2) ----------
+# ---------- TMDb cache ----------
 
 def _read_cache() -> dict[str, Any]:
     path = _cache_path()
@@ -216,22 +217,45 @@ def cache_show_id(series: str, show_id: int) -> None:
     _write_cache(cache)
 
 
-def get_cached_season(show_id: int, season: int) -> Optional[dict[int, str]]:
+def get_cached_season(show_id: int, season: int) -> Optional[dict[int, EpisodeInfo]]:
+    """Read a cached season, handling both old (title-only) and new formats.
+
+    Old format: {"1": "Episode Title", ...}      (v2.0 caches)
+    New format: {"1": {"title": "...", "runtime_min": 43}, ...}  (v2.1+)
+    """
     cache = _read_cache()
     key = f"{show_id}:{season}"
     raw = cache.get("seasons", {}).get(key)
     if not isinstance(raw, dict):
         return None
+
+    result: dict[int, EpisodeInfo] = {}
     try:
-        return {int(k): str(v) for k, v in raw.items()}
+        for k, v in raw.items():
+            num = int(k)
+            if isinstance(v, str):
+                # Old cache: title only, no runtime
+                result[num] = EpisodeInfo(number=num, title=v, runtime_min=None)
+            elif isinstance(v, dict):
+                rt = v.get("runtime_min")
+                runtime_min = int(rt) if isinstance(rt, (int, float)) and rt > 0 else None
+                result[num] = EpisodeInfo(
+                    number=num,
+                    title=str(v.get("title") or ""),
+                    runtime_min=runtime_min,
+                )
     except (TypeError, ValueError):
         return None
+    return result
 
 
-def cache_season(show_id: int, season: int, episodes: dict[int, str]) -> None:
+def cache_season(show_id: int, season: int, episodes: dict[int, EpisodeInfo]) -> None:
     cache = _read_cache()
     key = f"{show_id}:{season}"
-    cache["seasons"][key] = {str(k): v for k, v in episodes.items()}
+    cache["seasons"][key] = {
+        str(num): {"title": info.title, "runtime_min": info.runtime_min}
+        for num, info in episodes.items()
+    }
     _write_cache(cache)
 
 

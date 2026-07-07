@@ -90,18 +90,31 @@ def _resolve_show_id(series: str, api_key: str) -> Optional[int]:
         print(f"Enter a number between 0 and {len(matches)}.")
 
 
-def _fetch_titles(show_id: int, season: int, api_key: str) -> Optional[dict[int, str]]:
-    """Get episode titles, from cache or TMDb. None on failure."""
+def _fetch_season(show_id: int, season: int, api_key: str) -> Optional[dict[int, tmdb.EpisodeInfo]]:
+    """Get episode data (titles + runtimes), from cache or TMDb. None on failure."""
     cached = state.get_cached_season(show_id, season)
     if cached is not None:
         return cached
     try:
-        titles = tmdb.get_tv_season_episodes(show_id, season, api_key)
+        episodes = tmdb.get_tv_season_episodes(show_id, season, api_key)
     except tmdb.TMDbError as e:
         print(f"TMDb season lookup failed: {e}", file=sys.stderr)
         return None
-    state.cache_season(show_id, season, titles)
-    return titles
+    state.cache_season(show_id, season, episodes)
+    return episodes
+
+
+def _median_runtime_sec(episode_info: dict[int, tmdb.EpisodeInfo]) -> Optional[float]:
+    """Extract the median episode runtime (in seconds) from TMDb data, if any."""
+    runtimes = [
+        info.runtime_min * 60 for info in episode_info.values()
+        if info.runtime_min is not None and info.runtime_min > 0
+    ]
+    if not runtimes:
+        return None
+    s = sorted(runtimes)
+    n = len(s)
+    return s[n // 2] if n % 2 == 1 else (s[n // 2 - 1] + s[n // 2]) / 2
 
 
 # ---------- commands ----------
@@ -113,7 +126,6 @@ def cmd_rename(args: argparse.Namespace) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
-    # Handle --tmdb-key: save it to config for future runs
     if args.tmdb_key:
         state.save_config(tmdb_api_key=args.tmdb_key.strip())
         print(f"Saved TMDb API key to {state.config_dir() / 'config.json'}")
@@ -139,8 +151,7 @@ def cmd_rename(args: argparse.Namespace) -> int:
 
     print(f"\nFound {len(files)} video file(s):")
     for f in files:
-        marker = "! " if f.likely_extra else "  "
-        print(f"  {marker}{f.info.path.name}  ({_format_duration(f.info.duration_sec)})")
+        print(f"    {f.info.path.name}  ({_format_duration(f.info.duration_sec)})")
 
     dupes = scanner.find_duplicate_runtimes(files)
     if dupes:
@@ -148,16 +159,9 @@ def cmd_rename(args: argparse.Namespace) -> int:
         for a, b in dupes:
             print(f"     {a.info.path.name}  <->  {b.info.path.name}")
 
-    extras = [f for f in files if f.likely_extra]
-    if extras and not args.include_extras:
-        print(
-            f"\n{len(extras)} file(s) flagged as likely extras (short runtime); "
-            "excluded from rename. Use --include-extras to include."
-        )
-
     # Series / season / start-episode
     defaults = state.load_defaults()
-    series = args.series or _prompt("Series", defaults.get("series", ""))
+    series = args.series or _prompt("\nSeries", defaults.get("series", ""))
     if not series:
         print("error: series name required", file=sys.stderr)
         return 1
@@ -180,10 +184,12 @@ def cmd_rename(args: argparse.Namespace) -> int:
             print("error: starting episode must be an integer", file=sys.stderr)
             return 1
 
-    # TMDb title lookup (with graceful degradation)
+    # TMDb title/runtime lookup (with graceful degradation)
+    episode_info: Optional[dict[int, tmdb.EpisodeInfo]] = None
     titles: Optional[dict[int, str]] = None
+
     if args.no_titles:
-        print("\nSkipping TMDb title lookup (--no-titles).")
+        print("\nSkipping TMDb lookup (--no-titles).")
     else:
         api_key = state.get_tmdb_api_key(args.tmdb_key)
         if not api_key:
@@ -194,14 +200,46 @@ def cmd_rename(args: argparse.Namespace) -> int:
                 "  To silence this message, use --no-titles."
             )
         else:
-            print("\nLooking up episode titles...")
+            print("\nLooking up episode data on TMDb...")
             show_id = _resolve_show_id(series, api_key)
             if show_id is not None:
-                fetched = _fetch_titles(show_id, season, api_key)
-                if fetched is None or not fetched:
-                    print("No episode titles retrieved; continuing without titles.")
-                else:
-                    titles = fetched
+                episode_info = _fetch_season(show_id, season, api_key)
+                if episode_info:
+                    titles = {num: info.title for num, info in episode_info.items() if info.title}
+                    if not titles:
+                        titles = None
+
+    # Classify extras using TMDb runtime if available, else file median.
+    expected_sec: Optional[float] = None
+    if episode_info:
+        expected_sec = _median_runtime_sec(episode_info)
+
+    classification = scanner.refine_classification(files, expected_duration_sec=expected_sec)
+
+    print("\nClassification:")
+    if classification.reference_source == "tmdb":
+        print(
+            f"  Reference episode length: ~{_format_duration(classification.reference_duration_sec)} "
+            f"(from TMDb)"
+        )
+    elif classification.reference_source == "file_median":
+        print(
+            f"  Reference episode length: ~{_format_duration(classification.reference_duration_sec)} "
+            f"(median of scanned files — TMDb runtime unavailable)"
+        )
+    else:
+        print("  No reference duration available; using absolute floor only.")
+    print(f"  Minimum episode duration: {_format_duration(classification.threshold_sec)}")
+    print(
+        f"  {classification.episode_count} file(s) classified as episodes, "
+        f"{classification.extra_count} as extras."
+    )
+
+    extras = [f for f in files if f.likely_extra]
+    if extras and not args.include_extras:
+        print("\nExtras (excluded — pass --include-extras to include):")
+        for f in extras:
+            print(f"    {f.info.path.name}  ({_format_duration(f.info.duration_sec)})")
 
     # Build plan
     try:
@@ -221,7 +259,6 @@ def cmd_rename(args: argparse.Namespace) -> int:
         print("No files to rename.")
         return 1
 
-    # Preview
     print("\nPreview:")
     for item in plan.items:
         src_name = Path(item.src).name
@@ -317,10 +354,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="rip-rename",
         description="Rename MakeMKV/HandBrake TV rips to Plex-compatible filenames.",
     )
-    p.add_argument(
-        "path", nargs="?", default=".",
-        help="Directory containing video files (default: current directory)",
-    )
+    p.add_argument("path", nargs="?", default=".",
+                   help="Directory containing video files (default: current directory)")
     p.add_argument("--series", help="Series name (skips prompt)")
     p.add_argument("--season", type=int, help="Season number (skips prompt)")
     p.add_argument("--start", type=int, help="Starting episode number (skips prompt)")
@@ -329,7 +364,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", "-y", action="store_true",
                    help="Skip confirmation prompt (assume yes).")
     p.add_argument("--include-extras", action="store_true",
-                   help="Include files flagged as likely extras (short runtime).")
+                   help="Include files classified as extras.")
     p.add_argument("--undo", action="store_true",
                    help="Reverse the most recent rename operation.")
     p.add_argument("--no-titles", action="store_true",

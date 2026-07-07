@@ -40,6 +40,19 @@ class ShowMatch:
         return self.first_air_date[:4] if self.first_air_date else "----"
 
 
+@dataclass
+class EpisodeInfo:
+    """Per-episode data from TMDb.
+
+    `runtime_min` is in minutes and may be None if TMDb doesn't have a value
+    for a specific episode. Individual episodes can lack runtime even when
+    the show as a whole has data.
+    """
+    number: int
+    title: str
+    runtime_min: Optional[int]
+
+
 def _request(path: str, api_key: str, params: Optional[dict[str, Any]] = None) -> dict:
     """Make a GET request against the TMDb API and return parsed JSON."""
     query: dict[str, Any] = {"api_key": api_key}
@@ -87,15 +100,15 @@ def search_tv(query: str, api_key: str, limit: int = 5) -> list[ShowMatch]:
     return matches
 
 
-def get_tv_season_episodes(show_id: int, season: int, api_key: str) -> dict[int, str]:
-    """Return {episode_number: title} for the given season.
+def get_tv_season_episodes(show_id: int, season: int, api_key: str) -> dict[int, EpisodeInfo]:
+    """Return {episode_number: EpisodeInfo} for the given season.
 
-    A missing/empty title for a specific episode results in an empty string
-    value for that key. The caller decides how to render that.
+    A missing/empty title results in an empty string. A missing runtime
+    results in None. The caller decides how to render or use these.
     """
     data = _request(f"/tv/{show_id}/season/{season}", api_key)
     episodes = data.get("episodes") or []
-    titles: dict[int, str] = {}
+    result: dict[int, EpisodeInfo] = {}
     for ep in episodes:
         if "episode_number" not in ep:
             continue
@@ -103,5 +116,19 @@ def get_tv_season_episodes(show_id: int, season: int, api_key: str) -> dict[int,
             num = int(ep["episode_number"])
         except (TypeError, ValueError):
             continue
-        titles[num] = ep.get("name") or ""
-    return titles
+
+        rt = ep.get("runtime")
+        runtime_min: Optional[int]
+        try:
+            runtime_min = int(rt) if rt is not None else None
+        except (TypeError, ValueError):
+            runtime_min = None
+        if runtime_min is not None and runtime_min <= 0:
+            runtime_min = None  # TMDb sometimes returns 0 for unknown
+
+        result[num] = EpisodeInfo(
+            number=num,
+            title=ep.get("name") or "",
+            runtime_min=runtime_min,
+        )
+    return result
