@@ -1,4 +1,4 @@
-"""Command-line interface: argparse, interactive prompts, preview/execute flow."""
+"""Command-line interface: argparse, interactive prompts, TMDb lookup, preview/execute."""
 from __future__ import annotations
 
 import argparse
@@ -6,14 +6,17 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from . import ffprobe, scanner, rename, state
+from . import ffprobe, scanner, rename, state, tmdb
 
 
 # ---------- small UI helpers ----------
 
 def _prompt(question: str, default: str = "") -> str:
     suffix = f" [{default}]" if default else ""
-    resp = input(f"{question}{suffix}: ").strip()
+    try:
+        resp = input(f"{question}{suffix}: ").strip()
+    except EOFError:
+        return default
     return resp if resp else default
 
 
@@ -39,6 +42,68 @@ def _format_duration(sec: Optional[float]) -> str:
     return f"{m}:{s:02d}"
 
 
+# ---------- TMDb integration ----------
+
+def _resolve_show_id(series: str, api_key: str) -> Optional[int]:
+    """Look up a show ID, using cache when possible. Prompts on ambiguous matches."""
+    cached = state.get_cached_show_id(series)
+    if cached is not None:
+        return cached
+
+    try:
+        matches = tmdb.search_tv(series, api_key, limit=5)
+    except tmdb.TMDbAuthError as e:
+        print(f"TMDb auth error: {e}", file=sys.stderr)
+        return None
+    except tmdb.TMDbError as e:
+        print(f"TMDb lookup failed: {e}", file=sys.stderr)
+        return None
+
+    if not matches:
+        print(f"No TMDb matches for '{series}'.")
+        return None
+
+    if len(matches) == 1:
+        m = matches[0]
+        print(f"TMDb match: {m.name} ({m.year})")
+        state.cache_show_id(series, m.id)
+        return m.id
+
+    print(f"\nTMDb matches for '{series}':")
+    for i, m in enumerate(matches, start=1):
+        print(f"  {i}. {m.name} ({m.year})")
+    print(f"  0. None of these (skip title lookup)")
+
+    while True:
+        raw = _prompt("Choose", "1")
+        try:
+            choice = int(raw)
+        except ValueError:
+            print("Enter a number.")
+            continue
+        if choice == 0:
+            return None
+        if 1 <= choice <= len(matches):
+            picked = matches[choice - 1]
+            state.cache_show_id(series, picked.id)
+            return picked.id
+        print(f"Enter a number between 0 and {len(matches)}.")
+
+
+def _fetch_titles(show_id: int, season: int, api_key: str) -> Optional[dict[int, str]]:
+    """Get episode titles, from cache or TMDb. None on failure."""
+    cached = state.get_cached_season(show_id, season)
+    if cached is not None:
+        return cached
+    try:
+        titles = tmdb.get_tv_season_episodes(show_id, season, api_key)
+    except tmdb.TMDbError as e:
+        print(f"TMDb season lookup failed: {e}", file=sys.stderr)
+        return None
+    state.cache_season(show_id, season, titles)
+    return titles
+
+
 # ---------- commands ----------
 
 def cmd_rename(args: argparse.Namespace) -> int:
@@ -47,6 +112,11 @@ def cmd_rename(args: argparse.Namespace) -> int:
     except ffprobe.FFProbeError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+
+    # Handle --tmdb-key: save it to config for future runs
+    if args.tmdb_key:
+        state.save_config(tmdb_api_key=args.tmdb_key.strip())
+        print(f"Saved TMDb API key to {state.config_dir() / 'config.json'}")
 
     directory = Path(args.path).expanduser().resolve()
     if not directory.exists():
@@ -67,7 +137,6 @@ def cmd_rename(args: argparse.Namespace) -> int:
         print("No video files found.")
         return 1
 
-    # Show what we found
     print(f"\nFound {len(files)} video file(s):")
     for f in files:
         marker = "! " if f.likely_extra else "  "
@@ -86,7 +155,7 @@ def cmd_rename(args: argparse.Namespace) -> int:
             "excluded from rename. Use --include-extras to include."
         )
 
-    # Gather series / season / start-episode
+    # Series / season / start-episode
     defaults = state.load_defaults()
     series = args.series or _prompt("Series", defaults.get("series", ""))
     if not series:
@@ -96,9 +165,8 @@ def cmd_rename(args: argparse.Namespace) -> int:
     if args.season is not None:
         season = args.season
     else:
-        season_default = str(defaults.get("season", 1))
         try:
-            season = int(_prompt("Season", season_default))
+            season = int(_prompt("Season", str(defaults.get("season", 1))))
         except ValueError:
             print("error: season must be an integer", file=sys.stderr)
             return 1
@@ -112,13 +180,37 @@ def cmd_rename(args: argparse.Namespace) -> int:
             print("error: starting episode must be an integer", file=sys.stderr)
             return 1
 
-    # Build the plan
+    # TMDb title lookup (with graceful degradation)
+    titles: Optional[dict[int, str]] = None
+    if args.no_titles:
+        print("\nSkipping TMDb title lookup (--no-titles).")
+    else:
+        api_key = state.get_tmdb_api_key(args.tmdb_key)
+        if not api_key:
+            print(
+                "\nNo TMDb API key configured; renaming without episode titles.\n"
+                "  To enable titles: get a free key at https://www.themoviedb.org/settings/api\n"
+                "  Then run: rip-rename --tmdb-key <YOUR_KEY> (saves it) or set TMDB_API_KEY.\n"
+                "  To silence this message, use --no-titles."
+            )
+        else:
+            print("\nLooking up episode titles...")
+            show_id = _resolve_show_id(series, api_key)
+            if show_id is not None:
+                fetched = _fetch_titles(show_id, season, api_key)
+                if fetched is None or not fetched:
+                    print("No episode titles retrieved; continuing without titles.")
+                else:
+                    titles = fetched
+
+    # Build plan
     try:
         plan = rename.build_plan(
             files,
             series=series,
             season=season,
             start_episode=start,
+            titles=titles,
             include_extras=args.include_extras,
         )
     except ValueError as e:
@@ -126,7 +218,7 @@ def cmd_rename(args: argparse.Namespace) -> int:
         return 1
 
     if not plan.items:
-        print("No files to rename (all were excluded as extras?).")
+        print("No files to rename.")
         return 1
 
     # Preview
@@ -151,7 +243,7 @@ def cmd_rename(args: argparse.Namespace) -> int:
     if plan.has_warnings:
         print(
             "\nCannot proceed: plan has unresolved warnings. "
-            "Resolve conflicts (rename or remove the blocking files) and try again.",
+            "Resolve conflicts and try again.",
             file=sys.stderr,
         )
         return 1
@@ -160,7 +252,6 @@ def cmd_rename(args: argparse.Namespace) -> int:
         print("Aborted.")
         return 0
 
-    # Record history BEFORE executing — a crash mid-batch is still recoverable.
     state.record_execution(plan)
     state.save_defaults(series=series, season=season)
 
@@ -202,13 +293,12 @@ def cmd_undo(args: argparse.Namespace) -> int:
             "Resolve manually.",
             file=sys.stderr,
         )
-        # Put the entry back on the stack so the user can try again after fixing.
         state.record_execution(last)
         return 1
 
     if not args.yes and not _confirm("\nProceed with undo?", default_yes=True):
         print("Aborted.")
-        state.record_execution(last)  # push back onto history
+        state.record_execution(last)
         return 0
 
     succeeded, failed = rename.execute_plan(reverse)
@@ -228,34 +318,24 @@ def build_parser() -> argparse.ArgumentParser:
         description="Rename MakeMKV/HandBrake TV rips to Plex-compatible filenames.",
     )
     p.add_argument(
-        "path",
-        nargs="?",
-        default=".",
+        "path", nargs="?", default=".",
         help="Directory containing video files (default: current directory)",
     )
     p.add_argument("--series", help="Series name (skips prompt)")
     p.add_argument("--season", type=int, help="Season number (skips prompt)")
     p.add_argument("--start", type=int, help="Starting episode number (skips prompt)")
-    p.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would happen; make no changes.",
-    )
-    p.add_argument(
-        "--yes", "-y",
-        action="store_true",
-        help="Skip confirmation prompt (assume yes).",
-    )
-    p.add_argument(
-        "--include-extras",
-        action="store_true",
-        help="Include files flagged as likely extras (short runtime).",
-    )
-    p.add_argument(
-        "--undo",
-        action="store_true",
-        help="Reverse the most recent rename operation.",
-    )
+    p.add_argument("--dry-run", action="store_true",
+                   help="Show what would happen; make no changes.")
+    p.add_argument("--yes", "-y", action="store_true",
+                   help="Skip confirmation prompt (assume yes).")
+    p.add_argument("--include-extras", action="store_true",
+                   help="Include files flagged as likely extras (short runtime).")
+    p.add_argument("--undo", action="store_true",
+                   help="Reverse the most recent rename operation.")
+    p.add_argument("--no-titles", action="store_true",
+                   help="Skip TMDb episode-title lookup for this run.")
+    p.add_argument("--tmdb-key", metavar="KEY",
+                   help="Set/override the TMDb API key (also saved to config).")
     return p
 
 
