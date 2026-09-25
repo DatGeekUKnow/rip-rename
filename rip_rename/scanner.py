@@ -35,6 +35,32 @@ class ScannedFile:
     likely_extra: bool = False
 
 
+def _natural_sort_key(path: Path) -> list:
+    """Sort key that orders embedded numbers numerically, not lexicographically.
+
+    Plain sorting puts 'ep10' between 'ep1' and 'ep2' because it compares
+    character by character. This splits the name into text/number runs so
+    'ep2' < 'ep10' as a human would expect. Comparison is case-insensitive on
+    the text runs.
+
+    'ep1.mkv'  -> [(0,0,'ep'), (1,1,''), (0,0,'.mkv')]
+    'ep10.mkv' -> [(0,0,'ep'), (1,10,''), (0,0,'.mkv')]
+
+    Tuples keep text and numbers from ever being compared directly (which would
+    raise TypeError), by tagging each element with a type flag first.
+    """
+    import re
+    parts = re.split(r"(\d+)", path.name)
+    key: list = []
+    for i, part in enumerate(parts):
+        # Odd indices are the captured digit groups.
+        if i % 2 == 1:
+            key.append((1, int(part), ""))
+        else:
+            key.append((0, 0, part.lower()))
+    return key
+
+
 def _median(values: list[float]) -> Optional[float]:
     if not values:
         return None
@@ -51,8 +77,9 @@ def scan(
 ) -> list[ScannedFile]:
     """Return a sorted list of video files in `directory` with metadata attached.
 
-    Sort order is filename-lexicographic, which matches MakeMKV/HandBrake output
-    (t00.mkv, t01.mkv, ...) and is a good default proxy for episode order.
+    Sort order is natural (numeric-aware): t00, t01, ..., t10 and ep1, ep2,
+    ..., ep10 order the way a human reads them, which matches disc/episode
+    order and is a good default proxy for episode order.
 
     Classification of extras is intentionally not done here — call
     `refine_classification()` separately once you have a reference runtime
@@ -65,8 +92,9 @@ def scan(
 
     exts = {e.lower() for e in extensions}
     candidates = sorted(
-        p for p in directory.iterdir()
-        if p.is_file() and p.suffix.lower() in exts
+        (p for p in directory.iterdir()
+         if p.is_file() and p.suffix.lower() in exts),
+        key=_natural_sort_key,
     )
 
     results: list[ScannedFile] = []
