@@ -118,7 +118,7 @@ class MatchReport:
         return sum(len(m.episode_numbers) for m in self.matches)
 
 
-def match(
+def _match_core(
     files: list[ScannedFile],
     season_episodes: dict[int, EpisodeInfo],
     start_episode: int,
@@ -126,7 +126,8 @@ def match(
     """Walk files against expected episodes, producing a MatchReport.
 
     `files` should already have obvious extras filtered out (via
-    scanner.refine_classification with likely_extra=True files removed).
+    scanner.refine_classification with likely_extra=True files removed) and
+    any manually-pinned files removed (see `match()`, the public entry point).
     The matcher does additional runtime-based filtering on top.
     """
     report = MatchReport()
@@ -339,6 +340,58 @@ def match(
 
     # Any episodes left over after we've consumed all files → missing from disc.
     report.missing_episodes = ep_list[ep_idx:]
+    return report
+
+
+def match(
+    files: list[ScannedFile],
+    season_episodes: dict[int, EpisodeInfo],
+    start_episode: int,
+    manual_overrides: Optional[dict[str, int]] = None,
+) -> MatchReport:
+    """Public entry point. Wraps `_match_core`, handling manual pins first.
+
+    `manual_overrides` maps a file's basename (ScannedFile.info.path.name) to
+    an episode number the user has independently verified. This exists for
+    releases where disc authoring breaks the sequential-order assumption
+    (e.g. a season where one episode's only file is an "extended cut" whose
+    real runtime doesn't match TMDb's listed runtime, physically placed out
+    of sequence on a different disc) — a situation runtime tolerance cannot
+    resolve on its own, no matter how it's tuned, because the ambiguity is
+    about disc authoring, not duration.
+
+    Approach: pull pinned files and their target episode numbers OUT of the
+    walk entirely (both directions — a pin can point at a higher or lower
+    episode number than its file's position would suggest), run the normal
+    algorithm on whatever's left, then merge the pins back in as `kind="manual"`
+    matches. This sidesteps needing the walk itself to support jumping
+    backward/forward across episode numbers out of order.
+    """
+    manual_overrides = manual_overrides or {}
+    if not manual_overrides:
+        return _match_core(files, season_episodes, start_episode)
+
+    manual_matches: list[MatchAssignment] = []
+    remaining_files: list[ScannedFile] = []
+    remaining_episodes = dict(season_episodes)
+
+    for f in files:
+        target = manual_overrides.get(f.info.path.name)
+        if target is None:
+            remaining_files.append(f)
+            continue
+        manual_matches.append(MatchAssignment(
+            file=f, episode_numbers=[target], kind="manual",
+        ))
+        remaining_episodes.pop(target, None)
+
+    report = _match_core(remaining_files, remaining_episodes, start_episode)
+
+    # Merge manual matches back in, restoring original scan order for display.
+    order = {id(f): i for i, f in enumerate(files)}
+    combined = report.matches + manual_matches
+    combined.sort(key=lambda m: order[id(m.file)])
+    report.matches = combined
     return report
 
 

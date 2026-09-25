@@ -126,6 +126,7 @@ _STATUS_LABEL = {
     "assumed_no_tmdb":          "ASSUMED (V1 mode)",
     "extra":                    "EXTRA",
     "ambiguous_runtime":        "AMBIGUOUS — REVIEW",
+    "manual":                   "MANUAL (pinned)",
     "runtime_mismatch":         "MISMATCH",
     "split_episode_pt1":        "SPLIT?",
     "split_episode_pt2":        "SPLIT?",
@@ -218,6 +219,40 @@ def cmd_rename(args: argparse.Namespace) -> int:
         for a, b in dupes:
             print(f"     {a.info.path.name}  <->  {b.info.path.name}")
 
+    # Manual episode pins (--map), validated against what we actually scanned.
+    manual_overrides: dict[str, int] = {}
+    if args.map:
+        known_names = {f.info.path.name for f in files}
+        for entry in args.map:
+            if "=" not in entry:
+                print(f"error: --map entry must be FILENAME=EPISODE, got: {entry}",
+                      file=sys.stderr)
+                return 1
+            fname, _, ep_str = entry.rpartition("=")
+            try:
+                ep_num = int(ep_str)
+            except ValueError:
+                print(f"error: --map episode number must be an integer: {entry}",
+                      file=sys.stderr)
+                return 1
+            if fname not in known_names:
+                print(
+                    f"error: --map filename not found in scan: {fname!r}\n"
+                    f"  (must match exactly; check spelling/case against the "
+                    f"listing above)",
+                    file=sys.stderr,
+                )
+                return 1
+            manual_overrides[fname] = ep_num
+
+    if manual_overrides and args.no_titles:
+        print(
+            "error: --map requires TMDb episode data (titles/runtimes); "
+            "remove --no-titles.",
+            file=sys.stderr,
+        )
+        return 1
+
     # User inputs
     defaults = state.load_defaults()
     series = args.series or _prompt("\nSeries", defaults.get("series", ""))
@@ -279,8 +314,15 @@ def cmd_rename(args: argparse.Namespace) -> int:
 
     # Episode matching
     if episode_info:
-        report = matcher.match(candidates, episode_info, start)
+        report = matcher.match(candidates, episode_info, start, manual_overrides)
     else:
+        if manual_overrides:
+            print(
+                "error: --map given but TMDb episode data unavailable "
+                "(lookup may have failed above); can't apply pins without it.",
+                file=sys.stderr,
+            )
+            return 1
         report = matcher.build_naive_report(candidates, start)
 
     # Show classifier summary
@@ -464,6 +506,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Skip TMDb lookup for this run.")
     p.add_argument("--tmdb-key", metavar="KEY",
                    help="Set/override the TMDb API key (also saved to config).")
+    p.add_argument("--map", action="append", metavar="FILENAME=EPISODE", default=[],
+                   help="Pin a specific file to a specific episode number, "
+                        "bypassing automatic position/duration matching for "
+                        "it (repeatable). Use when you've independently "
+                        "verified a file's identity and disc order/duration "
+                        "can't be trusted for it. FILENAME must exactly match "
+                        "the name shown in the scan listing. "
+                        "Example: --map \"Disc 2_t05.mkv=9\"")
     return p
 
 
