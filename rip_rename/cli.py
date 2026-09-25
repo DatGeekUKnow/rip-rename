@@ -125,6 +125,7 @@ _STATUS_LABEL = {
     "assumed_no_tmdb_runtime":  "ASSUMED (no TMDb runtime)",
     "assumed_no_tmdb":          "ASSUMED (V1 mode)",
     "extra":                    "EXTRA",
+    "ambiguous_runtime":        "AMBIGUOUS — REVIEW",
     "runtime_mismatch":         "MISMATCH",
     "split_episode_pt1":        "SPLIT?",
     "split_episode_pt2":        "SPLIT?",
@@ -170,7 +171,8 @@ def _display_analysis(
         assigned_col = assigned.ljust(12)
         print(f"  {name}  {dur}  ->  {assigned_col}  [{label}]")
         if reason and kind in ("runtime_mismatch", "past_last_episode",
-                               "split_episode_pt1", "split_episode_pt2"):
+                               "split_episode_pt1", "split_episode_pt2",
+                               "ambiguous_runtime"):
             print(f"    reason: {reason}")
 
 

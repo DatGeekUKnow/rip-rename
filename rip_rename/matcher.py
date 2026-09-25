@@ -14,8 +14,13 @@ Special cases we detect during the walk:
   - PAST-LAST-EPISODE: files beyond the season's episode count with
     episode-like runtimes. Suggests something structurally wrong
     (wrong season? TMDb out of date?). Block the batch.
-  - EXTRA: file's runtime matches no episode in the season at all.
-    Silently excluded, not blocking.
+  - EXTRA: file's runtime matches no episode AND is clearly short
+    (well under half an episode's length). Silently excluded, not blocking.
+  - AMBIGUOUS_RUNTIME: file's runtime matches no episode, but is close
+    enough to episode length to plausibly BE one — TMDb runtime data may
+    be missing/wrong, or it's an unusually long extra. We can't tell which,
+    so this blocks the batch rather than guessing "extra" and silently
+    misaligning every file after it.
   - RUNTIME_MISMATCH: file matches SOME episode in the season but not the
     one at its position. Skip that file only; keep processing the rest.
   - ASSUMED: ffprobe couldn't read the file OR TMDb has no runtime for the
@@ -38,6 +43,19 @@ from .tmdb import EpisodeInfo
 # runtime distinguishes episode-vs-extra, not episode-vs-episode).
 TOLERANCE_MIN_SEC = 60.0
 TOLERANCE_PCT = 0.03
+
+# When a file matches NO episode's runtime, we still need to decide whether
+# it's a confident, silent "extra" or a case ambiguous enough to block on.
+# If its duration is at or above this fraction of the season's median known
+# runtime, it's plausibly episode-length -- and "doesn't match any known
+# runtime" then means either TMDb's data is wrong/missing for that episode,
+# or it's a genuinely long extra. We can't tell which, so we block instead
+# of silently excluding it (silent exclusion here does NOT advance the
+# episode pointer, which -- if this was actually a real episode -- shifts
+# every subsequent file's assignment down by one for the rest of the batch).
+# Below this ratio, it's confidently just a short extra: safe to exclude
+# without blocking. Matches the ratio scanner.py uses for the same reason.
+AMBIGUOUS_LENGTH_RATIO = 0.5
 
 
 def runtime_matches(
@@ -136,6 +154,19 @@ def match(
         )
 
     max_ep_num = max(e.number for e in season_episodes.values())
+
+    # Reference for the "is this plausibly episode-length?" check below.
+    known_runtimes_sec = sorted(
+        e.runtime_min * 60 for e in season_episodes.values()
+        if e.runtime_min is not None and e.runtime_min > 0
+    )
+    season_reference_sec: Optional[float] = None
+    if known_runtimes_sec:
+        n = len(known_runtimes_sec)
+        season_reference_sec = (
+            known_runtimes_sec[n // 2] if n % 2 == 1
+            else (known_runtimes_sec[n // 2 - 1] + known_runtimes_sec[n // 2]) / 2
+        )
 
     file_idx = 0
     ep_idx = 0
@@ -252,6 +283,37 @@ def match(
         # advance the episode pointer so downstream files stay aligned to the
         # expected sequence.
         if not matches_any_episode(f.info.duration_sec):
+            if (
+                season_reference_sec is not None
+                and f.info.duration_sec >= season_reference_sec * AMBIGUOUS_LENGTH_RATIO
+            ):
+                # Plausibly episode-length but matches no known runtime.
+                # Could be a real episode with missing/wrong TMDb runtime
+                # data, or an unusually long extra -- can't tell which, so
+                # block rather than silently guessing "extra" (which would
+                # leave the episode pointer unadvanced and shift every
+                # subsequent file's assignment down by one).
+                report.exclusions.append(Exclusion(
+                    file=f, kind="ambiguous_runtime",
+                    reason=(
+                        f"runtime {_fmt(f.info.duration_sec)} matches no known "
+                        f"episode, but is close to episode length "
+                        f"(~{_fmt(season_reference_sec)} season median)"
+                    ),
+                ))
+                report.block_reasons.append(
+                    f"{f.info.path.name} ({_fmt(f.info.duration_sec)}) doesn't match "
+                    f"any known episode runtime, but is long enough to plausibly BE "
+                    f"one -- currently expected around E{ep.number:02d}. This could "
+                    f"mean TMDb's runtime data is missing/wrong for that episode, or "
+                    f"this file is genuinely bonus content of unusual length. Verify "
+                    f"manually, then either move/rename the file out of the way or "
+                    f"confirm it belongs, and rerun."
+                )
+                file_idx += 1
+                # Don't advance ep_idx -- if this really is bonus content,
+                # the current episode still needs a real match from a later file.
+                continue
             report.exclusions.append(Exclusion(
                 file=f, kind="extra",
                 reason=f"runtime {_fmt(f.info.duration_sec)} doesn't match "
