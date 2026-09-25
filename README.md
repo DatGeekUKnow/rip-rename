@@ -1,4 +1,4 @@
-# rip-rename (V2.2)
+# rip-rename (V2.3)
 
 Renames MakeMKV/HandBrake TV rips (`t00.mkv`, `title01.mkv`, ...) to Plex-compatible
 filenames, with optional TMDb episode titles and runtime-based verification.
@@ -37,6 +37,7 @@ rip-rename --undo                                   # reverse last rename
 rip-rename --include-extras                         # don't exclude likely extras
 rip-rename --no-titles                              # skip TMDb lookup
 rip-rename --tmdb-key YOUR_KEY                       # set/save TMDb key
+rip-rename --map "t05.mkv=9" --map "t06.mkv=10"      # pin specific files
 ```
 
 TMDb key precedence: `--tmdb-key` flag > `TMDB_API_KEY` env var > saved config
@@ -127,6 +128,44 @@ Renamed 3 file(s).
 - Per-file analysis table shown before every rename, e.g.
   `t19.mkv  44:12  ->  S02E20-E21  [COMBINED]`.
 
+**Ambiguous-runtime blocking & manual pins (V2.3):**
+
+⚠️ **Important limitation to remember:** for shows with near-uniform episode
+lengths (procedurals especially — House, Law & Order, etc.), runtime
+tolerance is often wider than the actual difference between adjacent
+episodes. A `[MATCH]` label means "plausible duration for this position,"
+**not** "confirmed identity." Duration alone cannot tell episode N from N+1
+apart when they're the same length — position (disc/track order) is doing
+essentially all the identification work for these shows. Found the hard way
+on House S5: a file was confidently labeled S05E09 by position, but was
+actually S05E10 — the true S05E09 ("Last Resort") is an official 50-minute
+extended episode whose only copy sits out of sequence on a different disc.
+TMDb's runtime data for it didn't reflect the 50-minute length, so it looked
+like an anomaly rather than the correct episode.
+
+Given that limitation:
+- A file whose duration matches no known episode, but is close enough to
+  episode length to plausibly BE one (not obviously a short extra), now
+  **blocks the batch** rather than silently excluding it as "extra." Excluding
+  silently would leave the episode pointer un-advanced, which — if the file
+  was actually a real episode — shifts every subsequent file's assignment
+  down by one for the rest of the run. Clearly-short files (well under half
+  an episode) still exclude silently; that's safe.
+- **`--map FILENAME=EPISODE`** (repeatable): once you've independently
+  verified a file's real identity (usually: watch it), pin it directly
+  instead of fighting the tool via filenames — renaming a file does **not**
+  make the tool recognize an episode number; filenames are only ever used
+  for sort order, never parsed for episode identity. Pinned files are pulled
+  out of the matching walk entirely (works regardless of whether the pin's
+  target episode is higher or lower than the file's position would suggest),
+  and everything else re-aligns and matches normally around them.
+- **Bottom line for future reference:** if a season has near-identical
+  episode runtimes throughout, treat every `[MATCH]` with mild suspicion
+  rather than full trust, especially right after any excluded/blocked file.
+  Spot-check a few, and don't be surprised if disc authoring occasionally
+  places one episode's only copy out of normal sequence (as with House's
+  extended episodes) — `--map` exists specifically for that.
+
 ## What it does NOT do yet
 
 - No auto-handling of split episodes (Case B) — no established naming
@@ -154,7 +193,8 @@ rip_rename/
 ├── cli.py          # argparse, prompts, TMDb orchestration, preview/execute
 ├── ffprobe.py      # subprocess wrapper around ffprobe
 ├── scanner.py      # directory scan, duplicate detection, extras classification
-├── matcher.py      # runtime-verified file <-> episode matching (V2.2)
+├── matcher.py      # runtime-verified file <-> episode matching; match() wraps
+│                   # _match_core() to handle --map pins (V2.2/V2.3)
 ├── rename.py       # RenamePlan: build, execute, reverse
 ├── tmdb.py         # stdlib TMDb API client
 └── state.py        # JSON persistence (history, config, cache, defaults)

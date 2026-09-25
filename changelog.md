@@ -1,5 +1,35 @@
 # Changelog
 
+## V2.3 — Ambiguous-runtime blocking, manual episode pins
+- **Root issue:** for shows with near-uniform episode lengths (procedurals
+  especially — House, Law & Order, etc.), the runtime tolerance window is
+  often wider than the actual difference between adjacent episodes'
+  runtimes. A `[MATCH]` label only ever meant "plausible for this position,"
+  never "confirmed identity" — duration cannot disambiguate episode N from
+  N+1 when they're the same length. Discovered when House S05E10 was
+  silently mislabeled S05E09 (correct-looking duration, wrong episode).
+- Files whose duration matches no known episode, but are close enough to
+  episode length to plausibly BE one, now **block the batch** instead of
+  silently excluding as "extra." Excluding without blocking previously risked
+  shifting every subsequent file's assignment if the excluded file was
+  actually a real episode. Files clearly short (well under half an episode)
+  still exclude silently — that part is safe.
+  - Real trigger: House S05E09 "Last Resort" is an official 50-minute
+    extended episode, not a bonus/duplicate cut — TMDb's runtime data didn't
+    reflect this, so it looked ambiguous even though it was correct. Its
+    disc also skips E09 on the normal track sequence entirely, since that
+    episode's only file sits out of order on a different disc.
+- Added `--map FILENAME=EPISODE` (repeatable): pin a specific file to a
+  specific episode number once verified by other means (usually: watch it).
+  Pinned files are pulled out of the matching walk in both directions —
+  works whether the pin's target episode number is higher or lower than the
+  file's position would suggest — so the rest of the season still matches
+  normally around them. Requires TMDb data (titles/runtimes); doesn't work
+  with `--no-titles`.
+- `matcher.match()` is now a thin wrapper (`_match_core()` holds the actual
+  walk) that carves out pinned files/episodes before running the normal
+  algorithm, then merges pins back in for display in original scan order.
+
 ## V2.2 — Runtime verification & multi-episode handling
 - Added `matcher.py`: matches files to TMDb episodes by runtime, filename
   order remains primary.
